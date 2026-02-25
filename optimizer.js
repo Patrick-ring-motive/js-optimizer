@@ -92,6 +92,85 @@ function uniqueName(base, usedNames) {
   return `${base}$${n}`;
 }
 
+/**
+ * Deep-clone an AST node so that the clone can be placed in a different tree
+ * position without sharing object references with the original.
+ */
+function cloneNode(node) {
+  return JSON.parse(JSON.stringify(node));
+}
+
+/**
+ * Rename all references to `origName` → `newName` within the given body
+ * array, but stop at function/arrow boundaries when the name is re-declared
+ * (as a parameter or inner binding).  This prevents accidentally renaming
+ * identically-named variables in nested scopes.
+ */
+function scopeAwareRename(bodyArray, origName, newName) {
+  function visit(n) {
+    if (!n) return;
+    if (n.type === "Identifier" && n.name === origName) {
+      n.name = newName;
+      return;
+    }
+    // Stop at function boundaries if they re-declare the name
+    if (
+      n.type === "FunctionDeclaration" ||
+      n.type === "FunctionExpression" ||
+      n.type === "ArrowFunctionExpression"
+    ) {
+      const paramNames = new Set((n.params || []).flatMap((p) => collectPatternNames(p)));
+      if (paramNames.has(origName)) return; // shadowed by param — stop
+      // Check for var/let/const declarations of the same name in the body
+      if (n.body) {
+        const innerDecls = collectDeclaredNames(n.body);
+        if (innerDecls.has(origName)) return; // re-declared — stop
+      }
+    }
+    for (const key of Object.keys(n)) {
+      if (key === "type" || key === "loc" || key === "start" || key === "end") continue;
+      const child = n[key];
+      if (Array.isArray(child))                                    child.forEach(visit);
+      else if (child && typeof child === "object" && child.type)   visit(child);
+    }
+  }
+
+  bodyArray.forEach(visit);
+}
+
+/**
+ * Collect names that are declared (VariableDeclaration) within a node,
+ * without descending into nested functions.  Used by scopeAwareRename
+ * to detect inner-scope shadowing.
+ */
+function collectDeclaredNames(node) {
+  const names = new Set();
+  if (!node || typeof node !== "object") return names;
+
+  function visit(n) {
+    if (!n || typeof n !== "object") return;
+    if (n.type === "VariableDeclaration") {
+      n.declarations.forEach((d) =>
+        collectPatternNames(d.id).forEach((name) => names.add(name))
+      );
+    }
+    if (
+      n.type === "FunctionDeclaration" ||
+      n.type === "FunctionExpression" ||
+      n.type === "ArrowFunctionExpression"
+    ) return;
+    for (const key of Object.keys(n)) {
+      if (key === "type" || key === "loc" || key === "start" || key === "end") continue;
+      const child = n[key];
+      if (Array.isArray(child))                                    child.forEach(visit);
+      else if (child && typeof child === "object" && child.type)   visit(child);
+    }
+  }
+
+  visit(node);
+  return names;
+}
+
 // ─── Numeric / Length Helpers ────────────────────────────────────────────────
 
 /**
@@ -801,7 +880,9 @@ function passForEachToForLoop(ast) {
       }
 
       // Fast path: const-length for loop
-      const fastStatements = buildFastForLoop(arrayExpr, loopVar, itemParam, body, loopLabel);
+      // Clone arrayExpr so the fast path has its own AST nodes — sharing
+      // the same object reference across two tree positions breaks walk.
+      const fastStatements = buildFastForLoop(cloneNode(arrayExpr), loopVar, itemParam, body, loopLabel);
 
       // Slow path: original forEach call (unchanged)
       const slowStatement = { type: "ExpressionStatement", expression: call };
@@ -836,6 +917,470 @@ function passForEachToForLoop(ast) {
   return reports;
 }
 
+// ─── Pass: forOfToForLoop ────────────────────────────────────────────────────
+
+/**
+ * Converts:
+ *   for (const item of arr) { …body… }
+ *   for (let item of arr)   { …body… }
+ *
+ * Into a guarded indexed for-loop (same pattern as forEachToForLoop):
+ *
+ *   if (arr[Symbol.iterator] === [][Symbol.iterator]) {
+ *     const arr_length = arr.length || 0;
+ *     for (let _i = 0; _i !== arr_length; ++_i) {
+ *       const item = arr[_i];
+ *       …body…
+ *     }
+ *   } else {
+ *     for (const item of arr) { …body… }   // original — safe fallback
+ *   }
+ *
+ * Bails out when:
+ *   • Iteration variable is a destructuring pattern (complex to replicate)
+ *   • Declaration kind is `var` (hoisting semantics would differ)
+ *   • Loop has no declaration (bare `for (x of arr)`)
+ */
+function passForOfToForLoop(ast) {
+  const reports      = [];
+  const replacements = [];
+
+  walk.ancestor(ast, {
+    ForOfStatement(node, ancestors) {
+      // Must be a variable declaration (const/let), not a bare assignment
+      if (node.left.type !== "VariableDeclaration")                return;
+      const kind = node.left.kind;
+      if (kind !== "const" && kind !== "let")                      return;
+      if (node.left.declarations.length !== 1)                     return;
+
+      const decl = node.left.declarations[0];
+      // Only simple identifiers — bail on destructuring
+      if (decl.id.type !== "Identifier")                           return;
+
+      const itemName = decl.id.name;
+      const arrayExpr = node.right;
+      const body = node.body.type === "BlockStatement"
+        ? node.body
+        : { type: "BlockStatement", body: [node.body] };
+
+      const loopVar  = uniqueName("_i", collectIdentifiers(body));
+
+      // Fast path: indexed for loop
+      // Clone arrayExpr so the fast path has its own AST nodes — sharing
+      // the same object reference across two tree positions breaks walk.
+      const fastStatements = buildFastForLoop(
+        cloneNode(arrayExpr),
+        loopVar,
+        { type: "Identifier", name: itemName },
+        body,
+        null  // no label needed — for-of doesn't use rewriteReturns
+      );
+
+      // Slow path: original for-of (deep clone — shallow spread would share
+      // left/right child nodes with the original, which is now in the fast path)
+      const slowStatement = cloneNode(node);
+
+      const ifNode = {
+        type:       "IfStatement",
+        test:       buildIteratorGuard(arrayExpr),
+        consequent: { type: "BlockStatement", body: fastStatements },
+        alternate:  { type: "BlockStatement", body: [slowStatement] },
+      };
+
+      const parent    = ancestors[ancestors.length - 2];
+      const bodyArray = getBodyArray(parent);
+      if (!bodyArray) return;
+      const idx = bodyArray.indexOf(node);
+      if (idx === -1) return;
+
+      replacements.push({ bodyArray, index: idx, newNode: ifNode });
+
+      const arrLabel = escodegen.generate(arrayExpr);
+      reports.push(`  ✓ for (${kind} ${itemName} of ${arrLabel}) → guarded indexed for loop`);
+    },
+  });
+
+  replacements.reverse().forEach(({ bodyArray, index, newNode }) => {
+    bodyArray.splice(index, 1, newNode);
+  });
+
+  return reports;
+}
+
+// ─── Pass: hoistLoopInvariants ───────────────────────────────────────────────
+
+/**
+ * Returns a Set of identifier names that are mutated (assigned, updated, or
+ * declared) within the given AST node.
+ */
+function collectMutatedNames(node) {
+  const mutated = new Set();
+
+  walk.simple(node, {
+    AssignmentExpression(n) {
+      collectPatternNames(n.left).forEach((name) => mutated.add(name));
+    },
+    UpdateExpression(n) {
+      if (n.argument?.type === "Identifier") mutated.add(n.argument.name);
+    },
+    VariableDeclaration(n) {
+      n.declarations.forEach((d) =>
+        collectPatternNames(d.id).forEach((name) => mutated.add(name))
+      );
+    },
+  });
+
+  return mutated;
+}
+
+/**
+ * Returns a Set of all free identifier names referenced by an expression.
+ * Does NOT descend into nested function/arrow bodies.
+ */
+function collectFreeIdentifiers(node) {
+  const names = new Set();
+
+  function visit(n) {
+    if (!n) return;
+    if (n.type === "Identifier") { names.add(n.name); return; }
+    if (n.type === "FunctionDeclaration" || n.type === "FunctionExpression" || n.type === "ArrowFunctionExpression") return;
+    for (const key of Object.keys(n)) {
+      if (key === "type" || key === "loc" || key === "start" || key === "end") continue;
+      const child = n[key];
+      if (Array.isArray(child))                                    child.forEach(visit);
+      else if (child && typeof child === "object" && child.type)   visit(child);
+    }
+  }
+
+  visit(node);
+  return names;
+}
+
+/**
+ * Returns true if the expression is "pure" enough to hoist — no side-effects,
+ * no dependency on mutable state other than its free identifiers (which we
+ * check against the mutated-name set separately).
+ *
+ * Safe to hoist:
+ *   • Regex literals:                /pattern/flags
+ *   • new RegExp(literal, literal):  new RegExp("pat", "gi")
+ *   • Object/Array literals with only literal values
+ *   • Literal values
+ *   • Template literals with no expressions
+ *
+ * NOT safe (side-effects or non-deterministic):
+ *   • Function calls (except RegExp constructor with literal args)
+ *   • Property accesses (getters)
+ *   • Assignments
+ */
+function isHoistableExpression(node) {
+  if (!node) return false;
+
+  switch (node.type) {
+    // /pattern/flags  — always safe
+    case "Literal":
+      return true;
+
+    // new RegExp("pattern", "flags")  — safe when args are literals
+    case "NewExpression":
+      if (node.callee?.type === "Identifier" && node.callee.name === "RegExp") {
+        return node.arguments.length >= 1 &&
+               node.arguments.length <= 2 &&
+               node.arguments.every((a) => a.type === "Literal");
+      }
+      return false;
+
+    // [1, 2, 3]  or  { a: 1 }  with only literal members
+    case "ArrayExpression":
+      return node.elements.every((el) => el === null || isHoistableExpression(el));
+
+    case "ObjectExpression":
+      return node.properties.every(
+        (p) => p.type === "Property" && !p.computed && isHoistableExpression(p.value)
+      );
+
+    // `template` with no interpolation
+    case "TemplateLiteral":
+      return node.expressions.length === 0;
+
+    // -1, +0, !true
+    case "UnaryExpression":
+      return isHoistableExpression(node.argument);
+
+    // 1 + 2, "a" + "b"
+    case "BinaryExpression":
+      return isHoistableExpression(node.left) && isHoistableExpression(node.right);
+
+    default:
+      return false;
+  }
+}
+
+/**
+ * Hoists loop-invariant variable declarations out of loop bodies.
+ *
+ * A declaration  `const x = <expr>;`  inside a loop body is invariant when:
+ *   1. <expr> is a hoistable expression (regex, literal, etc.)
+ *   2. None of <expr>'s free identifiers are mutated inside the loop body
+ *   3. The declaration is at the top level of the loop body (not nested
+ *      inside an if/try/etc. where it might be conditionally executed)
+ *
+ * The declaration is moved to just before the loop statement.
+ */
+function passHoistLoopInvariants(ast) {
+  const reports      = [];
+  const operations   = []; // { bodyArray, loopIndex, stmtIndex, stmt, label }
+
+  const loopTypes = new Set([
+    "ForStatement", "ForInStatement", "ForOfStatement",
+    "WhileStatement", "DoWhileStatement",
+  ]);
+
+  walk.ancestor(ast, {
+    VariableDeclaration(node, ancestors) {
+      if (node.kind !== "const" && node.kind !== "let") return;
+      if (node.declarations.length !== 1)               return;
+      const decl = node.declarations[0];
+      if (!decl.init)                                   return;
+      if (!isHoistableExpression(decl.init))            return;
+
+      // Check that the declaration is a DIRECT child of a loop body.
+      // ancestors: [..., loopNode, BlockStatement, thisNode]
+      const directParent = ancestors[ancestors.length - 2];
+      let loopNode = null;
+      let loopAncestorIdx = -1;
+
+      if (directParent?.type === "BlockStatement") {
+        // The block's parent must be a loop whose .body IS this block
+        const blockParentIdx = ancestors.length - 3;
+        const blockParent = ancestors[blockParentIdx];
+        if (blockParent && loopTypes.has(blockParent.type) && blockParent.body === directParent) {
+          loopNode = blockParent;
+          loopAncestorIdx = blockParentIdx;
+        }
+        // Otherwise the decl is inside an if/try/etc. — bail
+      }
+      // If directParent is a loop itself (single-statement body, no block)
+      // we can't hoist since we'd need to restructure — bail
+
+      if (!loopNode) return;
+
+      // Check that no free identifier in the init expression is mutated in the loop body
+      const freeIds   = collectFreeIdentifiers(decl.init);
+      const mutated   = collectMutatedNames(loopNode.body);
+      for (const name of freeIds) {
+        if (mutated.has(name)) return;
+      }
+
+      // Find the loop in its parent body array
+      const loopParent = ancestors[loopAncestorIdx - 1];
+      if (!loopParent) return;
+      const parentBody = getBodyArray(loopParent);
+      if (!parentBody) return;
+      const loopIndex = parentBody.indexOf(loopNode);
+      if (loopIndex === -1) return;
+
+      // Find the statement in the loop body
+      const loopBody = getBodyArray(loopNode.body);
+      if (!loopBody) return;
+      const stmtIndex = loopBody.indexOf(node);
+      if (stmtIndex === -1) return;
+
+      const names = collectPatternNames(decl.id);
+      const exprLabel = escodegen.generate(decl.init);
+      const label = exprLabel.length > 40 ? exprLabel.slice(0, 37) + "…" : exprLabel;
+      operations.push({ parentBody, loopIndex, loopBody, stmtIndex, stmt: node, label: `${names.join(", ")} = ${label}` });
+
+      reports.push(`  ✓ hoisted: ${node.kind} ${names.join(", ")} = ${label}`);
+    },
+  });
+
+  // Sort operations for safe application:
+  // - Different parentBody/loopIndex: process higher loopIndex first so
+  //   insertions don't shift indices of later operations.
+  // - Same loopBody: process higher stmtIndex first so removals from the
+  //   loop body don't shift indices of later removals.
+  operations.sort((a, b) => {
+    // Primary: by parentBody insertion point (higher first)
+    if (a.parentBody === b.parentBody && a.loopIndex !== b.loopIndex) {
+      return b.loopIndex - a.loopIndex;
+    }
+    // Secondary: by stmtIndex within same loop body (higher first)
+    if (a.loopBody === b.loopBody) {
+      return b.stmtIndex - a.stmtIndex;
+    }
+    return 0;
+  });
+
+  operations.forEach(({ parentBody, loopIndex, loopBody, stmtIndex, stmt }) => {
+    // Collision check: collect all identifiers already in the target scope
+    const usedInParent = new Set();
+    for (const s of parentBody) collectIdentifiers(s).forEach((n) => usedInParent.add(n));
+
+    const decl = stmt.declarations[0];
+    const origName = decl.id.name;
+    const safeName = uniqueName(origName, usedInParent);
+
+    if (safeName !== origName) {
+      // Rename the declaration and all references in the loop body,
+      // stopping at function boundaries that shadow the name.
+      decl.id.name = safeName;
+      scopeAwareRename(loopBody, origName, safeName);
+    }
+
+    loopBody.splice(stmtIndex, 1);                    // remove from loop body
+    parentBody.splice(loopIndex, 0, stmt);             // insert before loop
+  });
+
+  return reports;
+}
+
+// ─── Pass: hoistFunctionInvariants ───────────────────────────────────────────
+
+/**
+ * Hoists invariant declarations out of function bodies to the enclosing scope.
+ *
+ * A declaration  `const x = <expr>;`  at the top level of a function body
+ * is invariant when:
+ *   1. <expr> is a hoistable expression (regex literal, new RegExp with
+ *      literal args, literal array/object, etc.)
+ *   2. None of <expr>'s free identifiers overlap with the function's
+ *      parameter names or any name mutated within the function body
+ *   3. The declaration is a direct child of the function's body block
+ *
+ * The declaration is moved to just before the enclosing function declaration /
+ * expression statement.
+ *
+ * This avoids re-creating identical objects (especially compiled RegExps)
+ * on every function call.
+ */
+function passHoistFunctionInvariants(ast) {
+  const reports    = [];
+  const operations = [];
+
+  walk.ancestor(ast, {
+    VariableDeclaration(node, ancestors) {
+      if (node.kind !== "const")                        return;
+      if (node.declarations.length !== 1)               return;
+      const decl = node.declarations[0];
+      if (!decl.init)                                   return;
+      if (!isHoistableExpression(decl.init))            return;
+
+      // The declaration must be a direct child of a function body block.
+      // ancestors: [..., funcNode, BlockStatement, thisNode]
+      // or for arrow with block: [..., arrowNode, BlockStatement, thisNode]
+      const bodyBlock = ancestors[ancestors.length - 2];
+      if (bodyBlock?.type !== "BlockStatement")         return;
+
+      const funcNode = ancestors[ancestors.length - 3];
+      if (!funcNode) return;
+      if (
+        funcNode.type !== "FunctionDeclaration" &&
+        funcNode.type !== "FunctionExpression" &&
+        funcNode.type !== "ArrowFunctionExpression"
+      ) return;
+      if (funcNode.body !== bodyBlock)                  return;
+
+      // Collect parameter names — the expression must not reference them
+      const paramNames = new Set(funcNode.params.flatMap((p) => collectPatternNames(p)));
+      const freeIds    = collectFreeIdentifiers(decl.init);
+      for (const name of freeIds) {
+        if (paramNames.has(name)) return;
+      }
+
+      // Also check that no free id is mutated inside the function body
+      const mutated = collectMutatedNames(bodyBlock);
+      for (const name of freeIds) {
+        if (mutated.has(name)) return;
+      }
+
+      // Find where to insert: walk up from the function node to find the
+      // first ancestor that is a direct child of a body array.  That
+      // ancestor is the "statement" we insert before.
+      let insertParent = null;
+      let insertNode   = null;
+
+      for (let i = ancestors.length - 3; i >= 0; i--) {
+        const anc = ancestors[i];
+        if (anc.type === "Program") {
+          // Top level: the child of Program that contains the function
+          const child = ancestors[i + 1];
+          if (child && anc.body.includes(child)) {
+            insertParent = anc.body;
+            insertNode   = child;
+          }
+          break;
+        }
+        if (i > 0) {
+          const parentOfAnc = ancestors[i - 1];
+          const body = getBodyArray(parentOfAnc);
+          if (body && body.includes(anc)) {
+            insertParent = body;
+            insertNode   = anc;
+            break;
+          }
+        }
+      }
+
+      if (!insertParent || !insertNode) return;
+
+      const insertIndex = insertParent.indexOf(insertNode);
+      if (insertIndex === -1) return;
+
+      // Don't hoist if we're already at the top level (no enclosing function)
+      // — there's no benefit to hoisting within Program scope.
+      const funcBody = getBodyArray(bodyBlock);
+      if (!funcBody) return;
+      const stmtIndex = funcBody.indexOf(node);
+      if (stmtIndex === -1) return;
+
+      const names = collectPatternNames(decl.id);
+      const exprLabel = escodegen.generate(decl.init);
+      const label = exprLabel.length > 40 ? exprLabel.slice(0, 37) + "…" : exprLabel;
+
+      operations.push({ outerBody: insertParent, insertIndex, funcBody, stmtIndex, stmt: node });
+      reports.push(`  ✓ hoisted: const ${names.join(", ")} = ${label}`);
+    },
+  });
+
+  // Sort operations for safe application:
+  // - Different outerBody/insertIndex: process higher insertIndex first so
+  //   insertions don't shift indices of later operations.
+  // - Same funcBody: process higher stmtIndex first so removals don't shift
+  //   indices of later removals.
+  operations.sort((a, b) => {
+    if (a.outerBody === b.outerBody && a.insertIndex !== b.insertIndex) {
+      return b.insertIndex - a.insertIndex;
+    }
+    if (a.funcBody === b.funcBody) {
+      return b.stmtIndex - a.stmtIndex;
+    }
+    return 0;
+  });
+
+  operations.forEach(({ outerBody, insertIndex, funcBody, stmtIndex, stmt }) => {
+    // Collision check: collect all identifiers already in the target scope
+    const usedInOuter = new Set();
+    for (const s of outerBody) collectIdentifiers(s).forEach((n) => usedInOuter.add(n));
+
+    const decl = stmt.declarations[0];
+    const origName = decl.id.name;
+    const safeName = uniqueName(origName, usedInOuter);
+
+    if (safeName !== origName) {
+      // Rename the declaration and all references in the function body,
+      // stopping at nested functions that shadow the name.
+      decl.id.name = safeName;
+      scopeAwareRename(funcBody, origName, safeName);
+    }
+
+    funcBody.splice(stmtIndex, 1);
+    outerBody.splice(insertIndex, 0, stmt);
+  });
+
+  return reports;
+}
+
 // ─── Pass Registry ───────────────────────────────────────────────────────────
 
 /**
@@ -859,6 +1404,21 @@ const PASSES = [
     description: "Convert .forEach(cb) to a guarded const-length for loop",
     fn:          passForEachToForLoop,
   },
+  {
+    id:          "forOfToForLoop",
+    description: "Convert for…of over arrays to a guarded indexed for loop",
+    fn:          passForOfToForLoop,
+  },
+  {
+    id:          "hoistLoopInvariants",
+    description: "Hoist loop-invariant declarations (regex, literals) above the loop",
+    fn:          passHoistLoopInvariants,
+  },
+  {
+    id:          "hoistFunctionInvariants",
+    description: "Hoist invariant declarations (regex, literals) out of function bodies",
+    fn:          passHoistFunctionInvariants,
+  },
 ];
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -871,11 +1431,18 @@ const PASSES = [
  *   @param {boolean} [flags.hoistLoopLength=true]
  *   @param {boolean} [flags.promoteConst=true]
  *   @param {boolean} [flags.forEachToForLoop=true]
+ *   @param {boolean} [flags.forOfToForLoop=true]
+ *   @param {boolean} [flags.hoistLoopInvariants=true]
+ *   @param {boolean} [flags.hoistFunctionInvariants=true]
  *   @param {boolean} [flags.verbose=true]
  * @returns {string} Optimized JS source code.
  */
 function optimize(source, flags = {}) {
-  const opts = { hoistLoopLength: true, promoteConst: true, forEachToForLoop: true, verbose: true, ...flags };
+  const opts = {
+    hoistLoopLength: true, promoteConst: true, forEachToForLoop: true,
+    forOfToForLoop: true, hoistLoopInvariants: true, hoistFunctionInvariants: true,
+    verbose: true, ...flags
+  };
 
   const ast     = acorn.parse(source, { ecmaVersion: 2020, sourceType: "module" });
   let   anyWork = false;
@@ -948,4 +1515,8 @@ if (require.main === module) {
   console.log(`[optimizer] Written → ${path.resolve(outputPath)}`);
 }
 
-module.exports = { optimize, listPasses, passHoistLoopLength, passPromoteConst, passForEachToForLoop };
+module.exports = {
+  optimize, listPasses,
+  passHoistLoopLength, passPromoteConst, passForEachToForLoop,
+  passForOfToForLoop, passHoistLoopInvariants, passHoistFunctionInvariants,
+};
