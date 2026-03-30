@@ -892,8 +892,7 @@ function buildFastForLoop(arrayExpr, loopVar, itemParam, body, label) {
 
   // If a label is provided, wrap the for-loop so labeled continue works
   // correctly when returns inside nested loops are rewritten.
-  const loopNode = label ?
-    {
+  const loopNode = label ? {
       type: "LabeledStatement",
       label: {
         type: "Identifier",
@@ -967,8 +966,7 @@ function passForEachToForLoop(ast) {
 
       // Normalise expression-body arrow to block form
       const rawBody = cb.body.type === "BlockStatement" ?
-        cb.body :
-        {
+        cb.body : {
           type: "BlockStatement",
           body: [{
             type: "ExpressionStatement",
@@ -1092,8 +1090,7 @@ function passForOfToForLoop(ast) {
       const itemName = decl.id.name;
       const arrayExpr = node.right;
       const body = node.body.type === "BlockStatement" ?
-        node.body :
-        {
+        node.body : {
           type: "BlockStatement",
           body: [node.body]
         };
