@@ -220,13 +220,14 @@ while (queue.length) {
   process(queue.shift().replace(re, "bar"));
 }
 
-// ✓ literal array inside loop
+// ✗ array literal — mutable, NOT hoisted (sharing across iterations would change semantics)
 for (const entry of entries) {
   const defaults = [0, 0, 0];
   merge(entry, defaults);
 }
 
-// ✓ two invariants in same loop body (tests stmtIndex staleness fix)
+// ✓ regex hoisted; ✗ array literal NOT hoisted — tests that stmtIndex stays
+//   correct when only one of two adjacent invariants is eligible for hoisting
 for (let i = 0; i < items.length; i++) {
   const sep = /[,;]/;
   const defaults = [0, 0, 0];
@@ -278,7 +279,7 @@ const sanitize2 = (input) => {
   return input.replace(dangerous, "");
 };
 
-// ✓ literal object inside function
+// ✗ object literal — mutable, NOT hoisted (sharing across calls would change semantics)
 function getDefaults() {
   const opts = { timeout: 3000, retries: 3 };
   return { ...opts };

@@ -689,9 +689,16 @@ function passHoistLoopLength(ast) {
 
       const arrayPath = extractLengthBasePath(test.right);
 
+      // ── Safety: bail when there's no stable path for the array ──
+      // This happens when the .length base is a function call (e.g. getRow().length)
+      // or a computed/dynamic member (e.g. matrix[i].length). In both cases we
+      // cannot verify mutation safety and the expression may not be referentially
+      // stable across iterations, so caching would change observable semantics.
+      if (!arrayPath) return;
+
       // ── Safety: bail if the array is mutated inside the loop body ──
       // Caching .length is unsafe if push/pop/splice/etc. change it mid-loop.
-      if (arrayPath && node.body && isArrayMutatedInBody(arrayPath, node.body)) return;
+      if (node.body && isArrayMutatedInBody(arrayPath, node.body)) return;
 
       // ── Transform ──
       // Choose cache name: plain `.length` → `arr_length`,
@@ -701,8 +708,8 @@ function passHoistLoopLength(ast) {
                             !test.right.computed &&
                             test.right.property?.name === "length";
       const baseName   = isPlainLength
-        ? pathToCacheName(arrayPath ?? "_loop")
-        : pathToBoundName(arrayPath ?? "_loop");
+        ? pathToCacheName(arrayPath)
+        : pathToBoundName(arrayPath);
       const scopeNode  = ancestors[ancestors.length - 2] ?? ast;
       const cacheName  = uniqueName(baseName, collectIdentifiers(scopeNode));
       const lengthNode = test.right;           // capture before overwriting
@@ -1424,10 +1431,10 @@ function passHoistFunctionInvariants(ast) {
       const insertIndex = insertParent.indexOf(insertNode);
       if (insertIndex === -1) return;
 
-      // Don't hoist if we're already at the top level (no enclosing function)
-      // — there's no benefit to hoisting within Program scope.
+      // Retrieve the statement list of the function body so we can find and
+      // remove the declaration by index.  bodyBlock is a confirmed BlockStatement
+      // so getBodyArray always returns its .body array here.
       const funcBody = getBodyArray(bodyBlock);
-      if (!funcBody) return;
       const stmtIndex = funcBody.indexOf(node);
       if (stmtIndex === -1) return;
 
@@ -1493,7 +1500,7 @@ const PASSES = [
   },
   {
     id:          "promoteConst",
-    description: "Promote let/var → const where the binding is never reassigned",
+    description: "Promote let → const where the binding is never reassigned",
     fn:          passPromoteConst,
   },
   {

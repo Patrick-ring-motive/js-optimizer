@@ -27,7 +27,10 @@ for (let i = 0; i < items.length; i++) {
   merge(items[i], defaults);
 }
 `, { verbose: false });
-check("array NOT hoisted out of loop", out1b.includes("const defaults ="));
+// The declaration must remain INSIDE the loop (after the `for` keyword)
+const defaults1bIdx = out1b.indexOf("const defaults =");
+const for1bIdx      = out1b.indexOf("for (");
+check("array NOT hoisted out of loop", defaults1bIdx !== -1 && for1bIdx !== -1 && defaults1bIdx > for1bIdx);
 
 const out1c = optimize(`
 for (let i = 0; i < items.length; i++) {

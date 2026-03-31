@@ -240,8 +240,7 @@ const version$2 = '1.0.2';
                     case 1:
                         _a.vocab = _b.sent();
                         this.trie = new Trie();
-                        const _loop_length = this.vocab.length || 0;
-                        for (vocabIndex = 999; vocabIndex < _loop_length; ++vocabIndex) {
+                        for (vocabIndex = 999; vocabIndex < this.vocab.length; vocabIndex++) {
                             word = this.vocab[vocabIndex];
                             this.trie.insert(word, 1, vocabIndex);
                         }
