@@ -1,7 +1,11 @@
 "use strict";
-const { optimize } = require("./optimizer");
+const {
+  optimize
+} = require("./optimizer");
 
-let pass = 0, fail = 0;
+let pass = 0,
+  fail = 0;
+
 function test(label, fn) {
   try {
     fn();
@@ -12,7 +16,10 @@ function test(label, fn) {
     console.log(`  FAIL  ${label}\n        ${e.message}`);
   }
 }
-function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
 
 // ── Issue 1: Stateful regex hoisting ─────────────────────────────────────
 // Regex with /g or /y flag has mutable .lastIndex.  Hoisting it out of a
@@ -26,10 +33,12 @@ function hasMatch(str) {
   return re.test(str);
 }
 `;
-  const out = optimize(src, { verbose: false });
+  const out = optimize(src, {
+    verbose: false
+  });
   // The regex should stay INSIDE the function — not be hoisted above it.
   // If hoisted, the const … = /foo/g line would appear BEFORE the function.
-  const funcIdx  = out.indexOf("function hasMatch");
+  const funcIdx = out.indexOf("function hasMatch");
   const regexIdx = out.indexOf("/foo/g");
   assert(regexIdx > funcIdx,
     `global regex was hoisted above function:\n${out}`);
@@ -42,8 +51,10 @@ function hasMatch(str) {
   return re.test(str);
 }
 `;
-  const out = optimize(src, { verbose: false });
-  const funcIdx  = out.indexOf("function hasMatch");
+  const out = optimize(src, {
+    verbose: false
+  });
+  const funcIdx = out.indexOf("function hasMatch");
   const regexIdx = out.indexOf("/foo/y");
   assert(regexIdx > funcIdx,
     `sticky regex was hoisted above function:\n${out}`);
@@ -57,9 +68,11 @@ for (let i = 0; i < lines.length; i++) {
   while (re.exec(lines[i])) {}
 }
 `;
-  const out = optimize(src, { verbose: false });
+  const out = optimize(src, {
+    verbose: false
+  });
   // regex should stay inside the for-loop body, not move before it
-  const forIdx   = out.indexOf("for ");
+  const forIdx = out.indexOf("for ");
   const regexIdx = out.indexOf("/foo/g");
   assert(regexIdx > forIdx,
     `global regex was hoisted above loop:\n${out}`);
@@ -72,8 +85,10 @@ function check(s) {
   return re.test(s);
 }
 `;
-  const out = optimize(src, { verbose: false });
-  const funcIdx  = out.indexOf("function check");
+  const out = optimize(src, {
+    verbose: false
+  });
+  const funcIdx = out.indexOf("function check");
   const regexIdx = out.indexOf("/foo/i");
   assert(regexIdx < funcIdx,
     `non-global regex should still be hoisted:\n${out}`);
@@ -86,8 +101,10 @@ function hasMatch(str) {
   return re.test(str);
 }
 `;
-  const out = optimize(src, { verbose: false });
-  const funcIdx  = out.indexOf("function hasMatch");
+  const out = optimize(src, {
+    verbose: false
+  });
+  const funcIdx = out.indexOf("function hasMatch");
   const regexpIdx = out.indexOf("new RegExp");
   assert(regexpIdx > funcIdx,
     `new RegExp("foo","g") was hoisted above function:\n${out}`);
@@ -105,7 +122,9 @@ arr.forEach(function(item) {
 });
 console.log(x);
 `;
-  const out = optimize(src, { verbose: false });
+  const out = optimize(src, {
+    verbose: false
+  });
   // The forEach should NOT be converted because the callback is a
   // FunctionExpression whose body contains `var` declarations.
   // If it IS converted, `var x = item` would leak into outer scope.
@@ -120,7 +139,9 @@ arr.forEach((item) => {
   use(x);
 });
 `;
-  const out = optimize(src, { verbose: false });
+  const out = optimize(src, {
+    verbose: false
+  });
   // Arrow functions don't create their own var scope, so var scoping is
   // unchanged by the conversion.  It should still be optimised.
   assert(!out.includes(".forEach(") || out.indexOf(".forEach(") > out.indexOf("else"),
@@ -139,7 +160,9 @@ async function fetchAll(urls) {
   }
 }
 `;
-  const out = optimize(src, { verbose: false });
+  const out = optimize(src, {
+    verbose: false
+  });
   // Should keep `for await` — must NOT be converted to indexed loop
   assert(out.includes("for await") || out.includes("for (const resp of"),
     `for-await-of was converted to indexed loop:\n${out}`);
@@ -155,7 +178,9 @@ function foo() {
   use(x);
 }
 `;
-  const out = optimize(src, { verbose: false });
+  const out = optimize(src, {
+    verbose: false
+  });
   assert(out.includes("var x"),
     `var was promoted to const:\n${out}`);
 });

@@ -9,7 +9,6 @@
 
 let items = [];
 
-
 // ✓ plain identifier  (canonical: init=0, op=< → !== + ++i)
 for (let i = 0; i < items.length; i++) {
   console.log(items[i]);
@@ -66,20 +65,24 @@ for (let i = 0; i < items.length; i++) {
   otherArr.push(items[i]);
 }
 
-
 // ════════════════════════════════════════════════════════════════════════════
 // Pass 2 — promoteConst
 // ════════════════════════════════════════════════════════════════════════════
 
-let config = loadConfig();      // ✓ → const
-let MAX    = 100;               // ✓ → const
-let { a, b } = getCoords();    // ✓ → const  (destructuring)
+let config = loadConfig(); // ✓ → const
+let MAX = 100; // ✓ → const
+let {
+  a,
+  b
+} = getCoords(); // ✓ → const  (destructuring)
 
-let x = 0;   x = computeX();  // ✗ reassigned
-let y = 1;   y++;              // ✗ updated
-let uninit;  uninit = fetch(); // ✗ no initializer
-var stable = 42;               // ✗ var — not promoted (hoisting semantics would change)
-
+let x = 0;
+x = computeX(); // ✗ reassigned
+let y = 1;
+y++; // ✗ updated
+let uninit;
+uninit = fetch(); // ✗ no initializer
+var stable = 42; // ✗ var — not promoted (hoisting semantics would change)
 
 // ════════════════════════════════════════════════════════════════════════════
 // Pass 3 — forEachToForLoop
@@ -159,7 +162,9 @@ items.forEach(item => {
 });
 
 // ✗ thisArg second argument — bail (cannot replicate binding)
-items.forEach(function(item) { this.process(item); }, context);
+items.forEach(function(item) {
+  this.process(item);
+}, context);
 
 // ✗ FunctionExpression using `this` — bail
 items.forEach(function(item) {
@@ -177,7 +182,6 @@ sparse.forEach(v => {
   console.log(v);
 });
 
-
 // ════════════════════════════════════════════════════════════════════════════
 // Pass 4 — forOfToForLoop
 // ════════════════════════════════════════════════════════════════════════════
@@ -193,7 +197,11 @@ for (let item of items) {
 }
 
 // ✗ destructuring — bail
-for (const { name, age } of items) {
+for (const {
+    name,
+    age
+  }
+  of items) {
   console.log(name, age);
 }
 
@@ -201,7 +209,6 @@ for (const { name, age } of items) {
 for (var item of items) {
   console.log(item);
 }
-
 
 // ════════════════════════════════════════════════════════════════════════════
 // Pass 5 — hoistLoopInvariants
@@ -253,10 +260,12 @@ for (let i = 0; i < items.length; i++) {
 const re = /existing/;
 for (let i = 0; i < items.length; i++) {
   const re = /^todo:/;
-  const cb = (text) => { const re = /inner/; return text.match(re); };
+  const cb = (text) => {
+    const re = /inner/;
+    return text.match(re);
+  };
   process(items[i].match(re), cb);
 }
-
 
 // ════════════════════════════════════════════════════════════════════════════
 // Pass 6 — hoistFunctionInvariants
@@ -281,8 +290,13 @@ const sanitize2 = (input) => {
 
 // ✗ object literal — mutable, NOT hoisted (sharing across calls would change semantics)
 function getDefaults() {
-  const opts = { timeout: 3000, retries: 3 };
-  return { ...opts };
+  const opts = {
+    timeout: 3000,
+    retries: 3
+  };
+  return {
+    ...opts
+  };
 }
 
 // ✗ regex uses a parameter — not invariant
